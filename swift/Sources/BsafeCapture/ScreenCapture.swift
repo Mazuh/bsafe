@@ -1,183 +1,158 @@
 import Foundation
 import ScreenCaptureKit
 
-class ScreenCapture: NSObject, SCStreamDelegate {
-    let fps: Int
-    let displayFilter: String?
-    var onFrame: ((CGImage, UInt32, TimeInterval) -> Void)?
+/// Per-pipeline SCStream delegate: forwards the stop to its pipeline so only
+/// that display restarts. Never exits; the pipeline owns recovery.
+final class PipelineStreamDelegate: NSObject, SCStreamDelegate {
+    weak var pipeline: DisplayPipeline?
 
-    private var streams: [(displayID: UInt32, stream: SCStream, output: DisplayStreamOutput)] = []
-
-    init(fps: Int, displayFilter: String? = nil) {
-        self.fps = fps
-        self.displayFilter = displayFilter
+    init(pipeline: DisplayPipeline? = nil) {
+        self.pipeline = pipeline
+        super.init()
     }
-
-    func start() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var startError: Error?
-
-        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-            if let error {
-                startError = error
-                semaphore.signal()
-                return
-            }
-
-            guard let content, !content.displays.isEmpty else {
-                startError = NSError(
-                    domain: "BsafeCapture", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "No displays found"]
-                )
-                semaphore.signal()
-                return
-            }
-
-            // Filter displays based on displayFilter
-            let filteredDisplays: [SCDisplay]
-            let primaryID = CGMainDisplayID()
-            let filter = self.displayFilter ?? "primary"
-
-            switch filter {
-            case "primary":
-                if let primary = content.displays.first(where: { $0.displayID == primaryID }) {
-                    filteredDisplays = [primary]
-                } else {
-                    // No primary found; fall back to first available display
-                    filteredDisplays = [content.displays[0]]  // safe: displays.isEmpty checked above
-                }
-            case "secondary":
-                let nonPrimary = content.displays.filter { $0.displayID != primaryID }
-                guard !nonPrimary.isEmpty else {
-                    startError = NSError(
-                        domain: "BsafeCapture", code: 3,
-                        userInfo: [NSLocalizedDescriptionKey: "No secondary display found"]
-                    )
-                    semaphore.signal()
-                    return
-                }
-                filteredDisplays = [nonPrimary[0]]
-            case "all":
-                filteredDisplays = content.displays
-            default:
-                // Numeric display ID
-                if let numericID = UInt32(filter) {
-                    guard let match = content.displays.first(where: { $0.displayID == numericID }) else {
-                        startError = NSError(
-                            domain: "BsafeCapture", code: 4,
-                            userInfo: [NSLocalizedDescriptionKey: "Display with ID \(filter) not found"]
-                        )
-                        semaphore.signal()
-                        return
-                    }
-                    filteredDisplays = [match]
-                } else {
-                    startError = NSError(
-                        domain: "BsafeCapture", code: 5,
-                        userInfo: [NSLocalizedDescriptionKey: "Invalid display filter: \(filter)"]
-                    )
-                    semaphore.signal()
-                    return
-                }
-            }
-
-            let captureGroup = DispatchGroup()
-
-            for display in filteredDisplays {
-                let filter = SCContentFilter(display: display, excludingWindows: [])
-                let config = SCStreamConfiguration()
-                config.width = display.width
-                config.height = display.height
-                config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(self.fps))
-                config.pixelFormat = kCVPixelFormatType_32BGRA
-                config.showsCursor = false
-                config.queueDepth = 3
-
-                let output = DisplayStreamOutput(displayID: display.displayID) { [weak self] cgImage, displayID, timestamp in
-                    self?.onFrame?(cgImage, displayID, timestamp)
-                }
-
-                do {
-                    let stream = SCStream(filter: filter, configuration: config, delegate: self)
-                    try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: .global())
-                    captureGroup.enter()
-                    stream.startCapture { captureError in
-                        if let captureError {
-                            fputs("BsafeCapture: failed to start capture for display \(display.displayID): \(captureError)\n", stderr)
-                        }
-                        captureGroup.leave()
-                    }
-                    self.streams.append((displayID: display.displayID, stream: stream, output: output))
-                } catch {
-                    fputs("BsafeCapture: failed to create stream for display \(display.displayID): \(error)\n", stderr)
-                }
-            }
-
-            captureGroup.notify(queue: .global()) {
-                if self.streams.isEmpty {
-                    startError = NSError(
-                        domain: "BsafeCapture", code: 2,
-                        userInfo: [NSLocalizedDescriptionKey: "Failed to start capture on any display"]
-                    )
-                }
-                semaphore.signal()
-            }
-        }
-
-        semaphore.wait()
-
-        if let startError {
-            throw startError
-        }
-
-        let ids = streams.map { String($0.displayID) }.joined(separator: ", ")
-        print("BsafeCapture: capturing \(streams.count) display(s): [\(ids)]")
-    }
-
-    func stop() {
-        for entry in streams {
-            entry.stream.stopCapture { _ in }
-        }
-        streams.removeAll()
-    }
-
-    // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("BsafeCapture: stream stopped with error: \(error)\n", stderr)
+        let code = (error as NSError).code
+        pipeline?.handleStreamStopped(code: code, stream: stream)
     }
 }
 
-// MARK: - Per-display stream output
-
-/// Each display gets its own SCStreamOutput handler so frames carry the correct displayID.
-class DisplayStreamOutput: NSObject, SCStreamOutput {
-    let displayID: UInt32
-    private let ciContext = CIContext()
-    private let handler: (CGImage, UInt32, TimeInterval) -> Void
-
-    init(displayID: UInt32, handler: @escaping (CGImage, UInt32, TimeInterval) -> Void) {
-        self.displayID = displayID
-        self.handler = handler
+/// Synchronously resolve the displays selected by the --display filter.
+/// Same selection semantics and errors as the original implementation.
+/// Returns the selected displays plus the full shareable content (for app exclusion).
+func resolveDisplays(filter rawFilter: String?) throws -> (displays: [SCDisplay], content: SCShareableContent) {
+    var fetched: SCShareableContent?
+    var fetchError: Error?
+    let sem = DispatchSemaphore(value: 0)
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+        fetched = content
+        fetchError = error
+        sem.signal()
+    }
+    if sem.wait(timeout: .now() + 5) == .timedOut {
+        throw NSError(
+            domain: "BsafeCapture", code: 6,
+            userInfo: [NSLocalizedDescriptionKey: "Timed out fetching shareable content"]
+        )
+    }
+    if let fetchError {
+        throw fetchError
+    }
+    guard let content = fetched, !content.displays.isEmpty else {
+        throw NSError(
+            domain: "BsafeCapture", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "No displays found"]
+        )
     }
 
-    func stream(
-        _ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-        of type: SCStreamOutputType
-    ) {
-        guard type == .screen else { return }
-        guard let imageBuffer = sampleBuffer.imageBuffer else { return }
+    let primaryID = CGMainDisplayID()
+    let filter = rawFilter ?? "primary"
+    let selected: [SCDisplay]
 
-        let ciImage = CIImage(cvImageBuffer: imageBuffer)
-        let width = CVPixelBufferGetWidth(imageBuffer)
-        let height = CVPixelBufferGetHeight(imageBuffer)
+    switch filter {
+    case "primary":
+        if let primary = content.displays.first(where: { $0.displayID == primaryID }) {
+            selected = [primary]
+        } else {
+            // No primary found; fall back to first available display
+            selected = [content.displays[0]]  // safe: displays.isEmpty checked above
+        }
+    case "secondary":
+        let nonPrimary = content.displays.filter { $0.displayID != primaryID }
+        guard !nonPrimary.isEmpty else {
+            throw NSError(
+                domain: "BsafeCapture", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "No secondary display found"]
+            )
+        }
+        selected = [nonPrimary[0]]
+    case "all":
+        selected = content.displays
+    default:
+        // Numeric display ID
+        if let numericID = UInt32(filter) {
+            guard let match = content.displays.first(where: { $0.displayID == numericID }) else {
+                throw NSError(
+                    domain: "BsafeCapture", code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Display with ID \(filter) not found"]
+                )
+            }
+            selected = [match]
+        } else {
+            throw NSError(
+                domain: "BsafeCapture", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid display filter: \(filter)"]
+            )
+        }
+    }
+    return (selected, content)
+}
 
-        guard
-            let cgImage = ciContext.createCGImage(
-                ciImage, from: CGRect(x: 0, y: 0, width: width, height: height))
-        else { return }
+/// SCWindows for the given window-server ids. Fetched after the overlay windows exist, so a capturable
+/// overlay can be excluded from our own capture (no feedback loop).
+func shareableWindows(withIDs ids: Set<CGWindowID>) -> [SCWindow] {
+    if ids.isEmpty { return [] }
+    let semaphore = DispatchSemaphore(value: 0)
+    var found: [SCWindow] = []
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, _ in
+        found = content?.windows.filter { ids.contains($0.windowID) } ?? []
+        semaphore.signal()
+    }
+    // Best effort on timeout (5 s): return what we have so the restart queue
+    // never blocks forever. The fetchDisplay/startCapture timeouts below are
+    // the ones counted as restart failures.
+    if semaphore.wait(timeout: .now() + 5) == .timedOut {
+        return found
+    }
+    return found
+}
 
-        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        handler(cgImage, displayID, timestamp)
+/// When set, overlay windows are capturable and our own app is excluded from capture instead.
+func isOverlayCapturable() -> Bool {
+    return ProcessInfo.processInfo.environment["BSAFE_OVERLAY_CAPTURABLE"] == "1"
+}
+
+/// Overlay present-lead in seconds (BSAFE_PRESENT_LEAD_MS env, default 16 ms).
+func presentLeadSeconds() -> Double {
+    if let s = ProcessInfo.processInfo.environment["BSAFE_PRESENT_LEAD_MS"], let ms = Double(s) {
+        return ms / 1000.0
+    }
+    return 0.016
+}
+
+/// Recompute the excluded windows the same way startup does, for stream
+/// restarts (displays/windows can be re-created after sleep/lock).
+/// When the overlay is not capturable-excluded this returns [] without
+/// touching AppKit at all (callers must also avoid snapshotting window ids
+/// in that case — see snapshotOverlayWindowIDs).
+func computeExcludedWindows(capturable: Bool, overlayWindowIDs: Set<CGWindowID>) -> [SCWindow] {
+    guard capturable else { return [] }
+    return shareableWindows(withIDs: overlayWindowIDs)
+}
+
+/// Synchronously fetch the SCDisplay with the given displayID, or nil when
+/// gone. A 5 s timeout also returns nil so the restart queue never blocks
+/// forever; the caller counts nil as a restart failure.
+func fetchDisplay(displayID: UInt32) -> SCDisplay? {
+    var fetched: SCShareableContent?
+    let sem = DispatchSemaphore(value: 0)
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+        fetched = content
+        sem.signal()
+    }
+    if sem.wait(timeout: .now() + 5) == .timedOut {
+        return nil
+    }
+    return fetched?.displays.first(where: { $0.displayID == displayID })
+}
+
+/// Backoff delay for restart attempt N (1-based): 0.25, 0.5, 1, 2, then 3 s.
+func restartDelay(forAttempt attempt: Int) -> Double {
+    switch attempt {
+    case 1: return 0.25
+    case 2: return 0.5
+    case 3: return 1.0
+    case 4: return 2.0
+    default: return 3.0
     }
 }

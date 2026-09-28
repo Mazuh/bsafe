@@ -4,6 +4,8 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
+from collections import deque
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,40 @@ def list_displays() -> list[dict]:
     return displays
 
 
+class StderrTail:
+    """Drain a helper stderr pipe in the background, keeping the last lines."""
+
+    def __init__(self, stream, max_lines: int = 50) -> None:
+        self._stream = stream
+        self._lines: deque[str] = deque(maxlen=max_lines)
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._drain, name="bsafe-helper-stderr", daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                try:
+                    chunk = self._stream.readline(8192)
+                except OSError, ValueError:
+                    break
+                if not chunk:
+                    break
+                line = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
+                with self._lock:
+                    self._lines.append(line)
+        finally:
+            try:
+                self._stream.close()
+            except OSError, ValueError:
+                pass
+
+    def text(self, timeout: float = 1.0) -> str:
+        self._thread.join(timeout)
+        with self._lock:
+            return "\n".join(self._lines)
+
+
 def spawn_helper(socket_path: str, fps: int, display: str = "primary") -> subprocess.Popen:
     """Spawn the Swift helper, pointing it at our socket."""
     helper = find_helper()
@@ -83,6 +119,6 @@ def spawn_helper(socket_path: str, fps: int, display: str = "primary") -> subpro
         cmd.extend(["--display", display])
     return subprocess.Popen(
         cmd,
-        stdout=None if verbose else subprocess.PIPE,
+        stdout=None if verbose else subprocess.DEVNULL,
         stderr=None if verbose else subprocess.PIPE,
     )

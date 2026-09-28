@@ -1,4 +1,5 @@
 import AppKit
+import BsafeCore
 import Foundation
 import ScreenCaptureKit
 
@@ -49,33 +50,94 @@ func parseArgs() -> (socketPath: String, fps: Int, display: String?) {
     return (socketPath, fps, display)
 }
 
-// MARK: - Censor payload parsing
+// MARK: - Big-endian packing helpers
 
-/// Parse CMD_CENSOR payload: [4B display_id][4B frame_width][4B frame_height][2B box_count][boxes...]
-/// Each box: [4B x (int32)][4B y (int32)][4B w (int32)][4B h (int32)]
-func parseCensorPayload(_ data: Data) -> (displayID: UInt32, frameWidth: UInt32, frameHeight: UInt32, boxes: [(x: Int32, y: Int32, w: Int32, h: Int32)])? {
-    let headerSize = 14  // 4 + 4 + 4 + 2
+func appendU16(_ data: inout Data, _ value: UInt16) {
+    var be = value.bigEndian
+    withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+}
+
+func appendU32(_ data: inout Data, _ value: UInt32) {
+    var be = value.bigEndian
+    withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+}
+
+// MARK: - CMD_START parsing
+
+struct StartParams {
+    var fps: Int
+    var scalePercent: Int
+    var persistPasses: Int
+    var smoothPercent: Int
+    var stats: Bool
+}
+
+/// Parse CMD_START payload: `!BHBBB` (fps, scale_percent, persist, smooth, flags)
+/// or legacy 1-byte (fps only). --fps stays the pre-CMD_START fallback.
+func parseStart(_ payload: Data, fallbackFps: Int) -> StartParams {
+    if payload.count >= 6 {
+        let fpsRaw = Int(payload[0])
+        let scaleRaw = (Int(payload[1]) << 8) | Int(payload[2])
+        let persistRaw = Int(payload[3])
+        let smoothRaw = Int(payload[4])
+        let flags = payload[5]
+        let fps = fpsRaw >= 1 ? fpsRaw : fallbackFps
+        var scale = scaleRaw
+        if scale < 100 { scale = 100 }
+        if scale > 200 { scale = 200 }
+        var persist = persistRaw
+        if persist < 1 { persist = 1 }
+        if persist > 255 { persist = 255 }
+        var smooth = smoothRaw
+        if smooth < 0 { smooth = 0 }
+        if smooth > 100 { smooth = 100 }
+        return StartParams(
+            fps: fps, scalePercent: scale, persistPasses: persist,
+            smoothPercent: smooth, stats: (flags & 0x01) != 0
+        )
+    } else if payload.count == 1 {
+        let f = Int(payload[0])
+        return StartParams(
+            fps: f >= 1 ? f : fallbackFps, scalePercent: 100,
+            persistPasses: 8, smoothPercent: 50, stats: false
+        )
+    } else {
+        return StartParams(
+            fps: fallbackFps, scalePercent: 100,
+            persistPasses: 8, smoothPercent: 50, stats: false
+        )
+    }
+}
+
+// MARK: - CMD_CENSOR_SEQ parsing
+
+/// Parse CMD_CENSOR_SEQ payload: `!IIIIH` (display_id, frame_w, frame_h, seq, box_count)
+/// then box_count x `!iiii` (x, y, w, h) in capture pixels of frame seq.
+func parseCensorSeq(_ data: Data) -> (displayID: UInt32, frameW: Int, frameH: Int, seq: UInt32, boxes: [TrackBox])? {
+    let headerSize = 18  // 4 + 4 + 4 + 4 + 2
     guard data.count >= headerSize else { return nil }
 
     let displayID = data.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self).bigEndian }
-    let frameWidth = data.withUnsafeBytes { $0.load(fromByteOffset: 4, as: UInt32.self).bigEndian }
-    let frameHeight = data.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt32.self).bigEndian }
-    let boxCount = data.withUnsafeBytes { $0.load(fromByteOffset: 12, as: UInt16.self).bigEndian }
+    let frameW = data.withUnsafeBytes { $0.load(fromByteOffset: 4, as: UInt32.self).bigEndian }
+    let frameH = data.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt32.self).bigEndian }
+    let seq = data.withUnsafeBytes { $0.load(fromByteOffset: 12, as: UInt32.self).bigEndian }
+    let boxCount = (Int(data[16]) << 8) | Int(data[17])
 
-    let expectedSize = headerSize + Int(boxCount) * 16
-    guard data.count >= expectedSize else { return nil }
+    guard data.count >= headerSize + Int(boxCount) * 16 else { return nil }
 
-    var boxes: [(x: Int32, y: Int32, w: Int32, h: Int32)] = []
+    var boxes: [TrackBox] = []
+    boxes.reserveCapacity(Int(boxCount))
     for i in 0..<Int(boxCount) {
         let offset = headerSize + i * 16
         let x = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: Int32.self).bigEndian }
         let y = data.withUnsafeBytes { $0.load(fromByteOffset: offset + 4, as: Int32.self).bigEndian }
         let w = data.withUnsafeBytes { $0.load(fromByteOffset: offset + 8, as: Int32.self).bigEndian }
         let h = data.withUnsafeBytes { $0.load(fromByteOffset: offset + 12, as: Int32.self).bigEndian }
-        boxes.append((x, y, w, h))
+        guard w > 0, h > 0 else { continue }
+        boxes.append(TrackBox(x: Double(x), y: Double(y), w: Double(w), h: Double(h)))
     }
 
-    return (displayID, frameWidth, frameHeight, boxes)
+    return (displayID, Int(frameW), Int(frameH), seq, boxes)
 }
 
 // MARK: - Permission check (early exit)
@@ -167,93 +229,181 @@ do {
     fputs("Failed to read CMD_START: \(error)\n", stderr)
     exit(1)
 }
-let (msgType, payload) = cmdStart
-guard msgType == 0x10 else {
-    fputs("Expected CMD_START (0x10), got 0x\(String(msgType, radix: 16))\n", stderr)
+guard cmdStart.type == 0x10 else {
+    fputs("Expected CMD_START (0x10), got 0x\(String(cmdStart.type, radix: 16))\n", stderr)
     exit(1)
 }
 
-let fps: Int
-if let firstByte = payload.first {
-    fps = Int(firstByte)
-    print("BsafeCapture: server requested FPS=\(fps)")
-} else {
-    fps = requestedFps
-}
+let params = parseStart(cmdStart.payload, fallbackFps: requestedFps)
+let captureScale = Double(params.scalePercent) / 100.0
+print("BsafeCapture: server start — fps=\(params.fps) scale=\(params.scalePercent)% persist=\(params.persistPasses) stats=\(params.stats ? "on" : "off")")
 
 // Initialize NSApplication for overlay windows (no dock icon)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
 // Censor style config (set by CMD_CENSOR_STYLE from Python).
-// Protected by censorStyleLock — written on the IPC thread, read when building overlay updates.
+// Protected by censorStyleLock — written on the reader thread, snapshotted by pipelines.
 var censorBlur: Double = 0.0
 var censorPixels: Double = 0.0
 var censorText: String? = nil
 let censorStyleLock = NSLock()
+let styleProvider: () -> CensorStyle = {
+    censorStyleLock.lock()
+    defer { censorStyleLock.unlock() }
+    return CensorStyle(blur: censorBlur, pixels: censorPixels, text: censorText)
+}
 
-// Overlay dictionary: one CensorOverlay per display, keyed by displayID
-var overlays: [UInt32: CensorOverlay] = [:]
-let overlaysLock = NSLock()
-
-let capture = ScreenCapture(fps: fps, displayFilter: displayArg)
-
-// JPEG quality matters for detection accuracy — 0.9 was validated empirically but
-// 0.7 may be a good bandwidth/accuracy tradeoff. Test and adjust if needed.
-let jpegQuality = 0.7
-
-// Set up frame callback: encode and send
-capture.onFrame = { cgImage, displayID, timestamp in
-    // Ensure overlay exists for this display. Create on main thread (sync) if needed.
-    overlaysLock.lock()
-    let hasOverlay = overlays[displayID] != nil
-    overlaysLock.unlock()
-
-    if !hasOverlay {
-        DispatchQueue.main.sync {
-            overlaysLock.lock()
-            // Double-check after acquiring lock on main thread
-            if overlays[displayID] == nil {
-                let overlay = CensorOverlay()
-                overlay.setup(displayID: displayID)
-                overlays[displayID] = overlay
-            }
-            overlaysLock.unlock()
+// Frame send path: one global serial queue; sends never block the display queues.
+// A failed write can leave a partial framed message on the stream, after which
+// every later message is corrupt — so a send failure is fatal.
+let frameSendQueue = DispatchQueue(label: "bsafe.send")
+let frameSender: (UInt32, UInt32, UInt32, Int64, UInt32, Data) -> Void = { did, w, h, ptsNs, seq, pixels in
+    frameSendQueue.async {
+        do {
+            try client.sendFrameRaw(displayID: did, width: w, height: h, ptsNs: ptsNs, seq: seq, pixels: pixels)
+        } catch {
+            fputs("BsafeCapture: failed to send frame: \(error)\n", stderr)
+            exit(1)
         }
-    }
-
-    guard let jpegData = FrameEncoder.encode(cgImage, quality: jpegQuality) else {
-        fputs("Failed to encode frame\n", stderr)
-        return
-    }
-
-    let width = UInt32(cgImage.width)
-    let height = UInt32(cgImage.height)
-    let tsNs = Int64(timestamp * 1_000_000_000)
-
-    var meta = Data()
-    meta.append(contentsOf: withUnsafeBytes(of: displayID.bigEndian) { Array($0) })
-    meta.append(contentsOf: withUnsafeBytes(of: width.bigEndian) { Array($0) })
-    meta.append(contentsOf: withUnsafeBytes(of: height.bigEndian) { Array($0) })
-    meta.append(contentsOf: withUnsafeBytes(of: tsNs.bigEndian) { Array($0) })
-
-    let payload = meta + jpegData
-    do {
-        try client.sendMessage(type: 0x01, payload: payload)
-    } catch {
-        fputs("Failed to send frame: \(error)\n", stderr)
     }
 }
 
-// Start capturing
+// Resolve displays with the same filter semantics as before.
+let resolved: (displays: [SCDisplay], content: SCShareableContent)
 do {
-    try capture.start()
+    resolved = try resolveDisplays(filter: displayArg)
 } catch {
-    fputs("Failed to start capture: \(error)\n", stderr)
+    fputs("Failed to resolve displays: \(error)\n", stderr)
     exit(1)
 }
 
-print("BsafeCapture: capturing at \(fps) FPS. Waiting for commands...")
+let capturable = isOverlayCapturable()
+if capturable {
+    print("BsafeCapture: BSAFE_OVERLAY_CAPTURABLE=1 — overlay visible to recorders, excluded from own capture")
+}
+
+let trackerConfig = TrackerConfig(
+    persistPasses: params.persistPasses
+)
+// smoothPercent is parsed for protocol compatibility; the live tracker no longer uses it.
+let leadSeconds = presentLeadSeconds()
+
+// Create one overlay (synchronously on the main thread) + pipeline per
+// display, start its stream, then report MSG_DISPLAY_INFO before any frame.
+var started: [(displayID: UInt32, pipeline: DisplayPipeline)] = []
+var startupIDs: [String] = []
+var overlaysByDisplay: [UInt32: CensorOverlay] = [:]
+for scDisplay in resolved.displays {
+    let overlay = CensorOverlay()
+    overlay.setup(displayID: scDisplay.displayID, capturable: capturable)
+    overlaysByDisplay[scDisplay.displayID] = overlay
+}
+// Reusable exclusion computation: restarts recompute this via the provider
+// below (windows can be re-created after sleep/lock). When the overlay is not
+// capturable this returns [] without touching NSWindow; otherwise window ids
+// are snapshotted on the main thread (startup runs on main, restarts run on a
+// background queue — snapshotOverlayWindowIDs handles both).
+let excludedWindowsProvider: () -> [SCWindow] = {
+    guard capturable else { return [] }
+    let ids = snapshotOverlayWindowIDs(Array(overlaysByDisplay.values))
+    return computeExcludedWindows(capturable: capturable, overlayWindowIDs: ids)
+}
+let excludedWindows = excludedWindowsProvider()
+if capturable {
+    let ids = snapshotOverlayWindowIDs(Array(overlaysByDisplay.values))
+    if excludedWindows.count != ids.count {
+        fputs("BsafeCapture: warning: could only exclude \(excludedWindows.count)/\(ids.count) overlay windows from capture\n", stderr)
+    }
+}
+for scDisplay in resolved.displays {
+    let did: UInt32 = scDisplay.displayID
+    let pointsW = scDisplay.width
+    let pointsH = scDisplay.height
+    let capW = Int((Double(pointsW) * captureScale).rounded())
+    let capH = Int((Double(pointsH) * captureScale).rounded())
+
+    guard let overlay = overlaysByDisplay[did] else { continue }
+    let pipeline = DisplayPipeline(
+        displayID: did,
+        captureWidth: capW,
+        captureHeight: capH,
+        pointsWidth: pointsW,
+        pointsHeight: pointsH,
+        scaleFactor: captureScale,
+        presentLead: leadSeconds,
+        config: trackerConfig,
+        overlay: overlay,
+        statsEnabled: params.stats,
+        styleProvider: styleProvider,
+        frameSender: frameSender
+    )
+    pipeline.configureRestart(fps: params.fps, excludedWindowsProvider: excludedWindowsProvider)
+    do {
+        try pipeline.startStream(display: scDisplay, fps: params.fps, excludingWindows: excludedWindows)
+    } catch {
+        fputs("BsafeCapture: failed to start capture for display \(did): \(error)\n", stderr)
+        continue
+    }
+
+    var info = Data()
+    appendU32(&info, did)
+    appendU32(&info, UInt32(capW))
+    appendU32(&info, UInt32(capH))
+    appendU32(&info, UInt32(pointsW))
+    appendU32(&info, UInt32(pointsH))
+    do {
+        try client.sendMessage(type: 0x03, payload: info)
+    } catch {
+        fputs("BsafeCapture: failed to send display info for display \(did): \(error)\n", stderr)
+        exit(1)
+    }
+
+    started.append((displayID: did, pipeline: pipeline))
+    startupIDs.append(String(did))
+}
+
+guard !started.isEmpty else {
+    fputs("BsafeCapture: failed to start capture on any display\n", stderr)
+    exit(1)
+}
+
+print("BsafeCapture: capturing \(started.count) display(s): [\(startupIDs.joined(separator: ", "))] at \(params.fps) FPS, scale=\(params.scalePercent)%")
+
+let routes: [UInt32: DisplayPipeline] = Dictionary(uniqueKeysWithValues: started.map { ($0.displayID, $0.pipeline) })
+
+// Debug hook (harmless): `kill -USR1 <BsafeCapture pid>` simulates a stream
+// interruption on every display — stopCapture plus the same restart path as
+// didStopWithError with synthetic code -1.
+signal(SIGUSR1, SIG_IGN)
+let usr1Source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: DispatchQueue.global())
+usr1Source.setEventHandler {
+    for pipeline in routes.values {
+        pipeline.simulateInterruption()
+    }
+}
+usr1Source.resume()
+
+// Stats timer (only when the server asked for native stats).
+var statsTimer: DispatchSourceTimer? = nil
+if params.stats {
+    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+    timer.schedule(deadline: .now() + 2.0, repeating: 2.0)
+    timer.setEventHandler {
+        for pipeline in routes.values {
+            if let line = pipeline.takeStatsLine() {
+                do {
+                    try client.sendMessage(type: 0x04, payload: Data(line.utf8))
+                } catch {
+                    fputs("BsafeCapture: failed to send stats: \(error)\n", stderr)
+                    exit(1)
+                }
+            }
+        }
+    }
+    timer.resume()
+    statsTimer = timer
+}
 
 // Listen for commands from Python in background
 DispatchQueue.global().async {
@@ -261,23 +411,21 @@ DispatchQueue.global().async {
         do {
             let (msgType, payload) = try client.readMessage()
             switch msgType {
-            case 0x20:  // CMD_CENSOR
-                guard let censor = parseCensorPayload(payload) else {
-                    fputs("BsafeCapture: failed to parse CMD_CENSOR payload\n", stderr)
-                    continue
+            case 0x12:  // CMD_REQUEST_FRAME: grant one frame credit
+                guard payload.count >= 4 else { continue }
+                let did = payload.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self).bigEndian }
+                if let pipe = routes[did] {
+                    pipe.queue.async { pipe.handleCredit() }
                 }
-                overlaysLock.lock()
-                let overlay = overlays[censor.displayID]
-                overlaysLock.unlock()
-                if let overlay {
-                    censorStyleLock.lock()
-                    let blur = censorBlur
-                    let pixels = censorPixels
-                    let text = censorText
-                    censorStyleLock.unlock()
-                    overlay.updateBoxes(censor.boxes, frameWidth: censor.frameWidth, frameHeight: censor.frameHeight, blur: blur, pixels: pixels, text: text)
-                } else {
-                    fputs("BsafeCapture: no overlay for display \(censor.displayID), skipping censor\n", stderr)
+            case 0x22:  // CMD_CENSOR_SEQ: detections for frame seq
+                guard let det = parseCensorSeq(payload) else { continue }
+                if let pipe = routes[det.displayID] {
+                    pipe.queue.async {
+                        pipe.handleDetections(
+                            frameWidth: det.frameW, frameHeight: det.frameH,
+                            seq: det.seq, boxes: det.boxes
+                        )
+                    }
                 }
             case 0x21:  // CMD_CENSOR_STYLE
                 guard payload.count >= 6 else {
@@ -297,9 +445,13 @@ DispatchQueue.global().async {
                 }
                 censorStyleLock.unlock()
                 print("BsafeCapture: censor style updated — blur=\(censorBlur), pixels=\(censorPixels), text=\(censorText ?? "none")")
+            case 0x20:  // Legacy CMD_CENSOR: unused by live v2
+                continue
             case 0xFF:  // CMD_SHUTDOWN
                 print("BsafeCapture: received shutdown command")
-                capture.stop()
+                for pipeline in routes.values {
+                    pipeline.stopStream()
+                }
                 client.disconnect()
                 exit(0)
             default:
@@ -308,7 +460,9 @@ DispatchQueue.global().async {
         } catch {
             // Connection lost
             print("BsafeCapture: connection lost, shutting down")
-            capture.stop()
+            for pipeline in routes.values {
+                pipeline.stopStream()
+            }
             exit(0)
         }
     }

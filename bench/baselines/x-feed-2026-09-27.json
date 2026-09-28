@@ -1,0 +1,101 @@
+{
+  "name": "x-feed-2026-09-27",
+  "description": "Frozen live pipeline baseline. Three 48 s recordings of scrolling X search results ('feet', 'butt', 'armpits'), 60 fps CFR, recorded at 3456x2234 and scaled to the live capture size 1728x1116. Recordings are not in the repo (personal, explicit content).",
+  "live_config": {
+    "model": "320n",
+    "censor": "body",
+    "padding": 0.4,
+    "min_padding": 24,
+    "extra_scales": [
+      0.5
+    ],
+    "detect_scale": 1.0,
+    "tracker": {
+      "persist_passes": 8,
+      "min_persist_s": 1.0,
+      "shrink_alpha": 0.1
+    },
+    "present_lead_ms": 16,
+    "overhead_ms": 10
+  },
+  "ground_truth": {
+    "live_dets": "same detector (320n + 0.5 extra pass) on every frame: measures tracking/latency only",
+    "oracle_640m": "NudeNet 640m full-frame on the live-size recording, conf >= 0.25: includes recall misses"
+  },
+  "reproduce": [
+    "bsafe bench detect REC-live.mov -o DIR --extra-scales 0.5",
+    "bsafe bench detect REC-live.mov -o ORACLE --model 640m",
+    "bsafe bench replay DIR --censor body --padding 0.4 --min-padding 24 --overhead-ms 10 [--gt-dets ORACLE/dets.jsonl]"
+  ],
+  "results": {
+    "feet": {
+      "live_dets": {
+        "leak_frac": 0.054997990549148314,
+        "leak_frames_pct": 5.951099492541903,
+        "flicker_per_min": 15.00521014241056,
+        "over_censor_pct": 4.482932748551216,
+        "objects_missed_pct": 24.952015355086374,
+        "objects_missed_by_live_pct": 0.0,
+        "n_objects": 521,
+        "n_gt_boxes": 6503
+      },
+      "oracle_640m": {
+        "leak_frac": 0.10586392841458954,
+        "leak_frames_pct": 11.59235668789809,
+        "flicker_per_min": 5.001736714136853,
+        "over_censor_pct": 5.406494272592833,
+        "objects_missed_pct": 33.789954337899545,
+        "objects_missed_by_live_pct": 20.54794520547945,
+        "n_objects": 219,
+        "n_gt_boxes": 3140
+      },
+      "mean_detect_ms": 20.8
+    },
+    "butt": {
+      "live_dets": {
+        "leak_frac": 0.054783673030697526,
+        "leak_frames_pct": 5.867126833477135,
+        "flicker_per_min": 0.0,
+        "over_censor_pct": 1.4181729702310604,
+        "objects_missed_pct": 26.715686274509803,
+        "objects_missed_by_live_pct": 0.0,
+        "n_objects": 408,
+        "n_gt_boxes": 3477
+      },
+      "oracle_640m": {
+        "leak_frac": 0.17009891304344782,
+        "leak_frames_pct": 18.172431595250387,
+        "flicker_per_min": 1.2504341785342132,
+        "over_censor_pct": 1.4731436684748618,
+        "objects_missed_pct": 25.38860103626943,
+        "objects_missed_by_live_pct": 6.7357512953367875,
+        "n_objects": 193,
+        "n_gt_boxes": 1937
+      },
+      "mean_detect_ms": 23.6
+    },
+    "armpits": {
+      "live_dets": {
+        "leak_frac": 0.11514683259900549,
+        "leak_frames_pct": 11.792207792207792,
+        "flicker_per_min": 5.001736714136853,
+        "over_censor_pct": 1.9896972940699302,
+        "objects_missed_pct": 34.33476394849785,
+        "objects_missed_by_live_pct": 0.0,
+        "n_objects": 466,
+        "n_gt_boxes": 3850
+      },
+      "oracle_640m": {
+        "leak_frac": 0.23372907034338997,
+        "leak_frames_pct": 23.459812321501428,
+        "flicker_per_min": 5.001736714136853,
+        "over_censor_pct": 2.2539743982013944,
+        "objects_missed_pct": 40.4040404040404,
+        "objects_missed_by_live_pct": 17.67676767676768,
+        "n_objects": 198,
+        "n_gt_boxes": 2451
+      },
+      "mean_detect_ms": 25.1
+    }
+  }
+}

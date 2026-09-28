@@ -57,6 +57,7 @@ ERAX_UNSUPPORTED_FLAGS: dict[str, str] = {
     "face_male": "--face-male",
     "face_female": "--face-female",
     "feet": "--feet",
+    "buttocks": "--buttocks",
 }
 
 
@@ -108,7 +109,10 @@ class _NudeNetBackend:
         from nudenet import NudeDetector
 
         self.min_confidence = min_confidence
-        self._detector = NudeDetector(model_path=model_path) if model_path else NudeDetector()
+        if model_path:
+            self._detector = NudeDetector(model_path=model_path)
+        else:
+            self._detector = NudeDetector()
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", prefix="bsafe-det-", delete=False)
         self._tmp_path = tmp.name
         tmp.close()

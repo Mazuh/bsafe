@@ -111,3 +111,7 @@ class BoxTracker:
         self._tracks[display_id] = tracks
 
         return [t.to_tuple() for t in tracks]
+
+    def clear(self, display_id: int) -> None:
+        """Drop all tracks for a display (used when a stale result is rejected)."""
+        self._tracks.pop(display_id, None)

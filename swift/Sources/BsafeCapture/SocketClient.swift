@@ -58,6 +58,10 @@ class SocketClient {
                 ]
             )
         }
+
+        // Large send buffer for multi-MB raw frames; ignore failure.
+        var sndbuf: Int32 = 8 * 1024 * 1024
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
     }
 
     func sendMessage(type: UInt8, payload: Data) throws {
@@ -75,8 +79,36 @@ class SocketClient {
         }
     }
 
-    /// Max message payload size (50 MB — must match Python's MAX_MESSAGE_SIZE)
-    private static let maxMessageSize = 50 * 1024 * 1024
+    /// Send MSG_FRAME_RAW (0x02) without concatenating the pixels into a new
+    /// buffer: framing header + 24-byte `!IIIqI` header, then the pixels.
+    func sendFrameRaw(displayID: UInt32, width: UInt32, height: UInt32, ptsNs: Int64, seq: UInt32, pixels: Data) throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+
+        let length = UInt32(1 + 24 + pixels.count)
+        var header = Data()
+        header.reserveCapacity(5 + 24)
+        SocketClient.appendBE(&header, length)
+        header.append(0x02)
+        SocketClient.appendBE(&header, displayID)
+        SocketClient.appendBE(&header, width)
+        SocketClient.appendBE(&header, height)
+        SocketClient.appendBE(&header, ptsNs)
+        SocketClient.appendBE(&header, seq)
+
+        try send(data: header)
+        if !pixels.isEmpty {
+            try send(data: pixels)
+        }
+    }
+
+    private static func appendBE<T: FixedWidthInteger>(_ data: inout Data, _ value: T) {
+        var be = value.bigEndian
+        withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
+    }
+
+    /// Max message payload size (256 MiB — must match Python's MAX_MESSAGE_SIZE)
+    private static let maxMessageSize = 256 * 1024 * 1024
 
     func readMessage() throws -> (type: UInt8, payload: Data) {
         readLock.lock()
@@ -126,6 +158,13 @@ class SocketClient {
             var sent = 0
             while sent < data.count {
                 let result = Darwin.send(fd, base + sent, data.count - sent, 0)
+                if result < 0 {
+                    if errno == EINTR { continue }
+                    throw NSError(
+                        domain: "SocketClient", code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "Send failed"]
+                    )
+                }
                 guard result > 0 else {
                     throw NSError(
                         domain: "SocketClient", code: 4,
@@ -143,6 +182,15 @@ class SocketClient {
         while received < count {
             let result = buffer.withUnsafeMutableBytes { buf in
                 Darwin.recv(fd, buf.baseAddress! + received, count - received, 0)
+            }
+            if result < 0 {
+                if errno == EINTR { continue }
+                throw NSError(
+                    domain: "SocketClient", code: 5,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Connection closed"
+                    ]
+                )
             }
             guard result > 0 else {
                 throw NSError(

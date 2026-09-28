@@ -88,6 +88,51 @@ def test_build_censor_boxes_empty():
     assert build_censor_boxes([], CENSOR_PRESETS["all"], 0.2, 1920, 1080) == []
 
 
+def test_pad_box_min_padding_grows_small_box():
+    # 20x20 box with padding 0.0 would stay put; floor of 48 px per side wins.
+    x, y, w, h = pad_box((100, 100, 20, 20), 0.0, 1920, 1080, min_padding=48)
+    assert (x, y, w, h) == (52, 52, 116, 116)
+
+
+def test_pad_box_min_padding_leaves_large_box_untouched():
+    # 200x200 box with padding 0.4 → 80 px per side, above the 48 px floor.
+    assert pad_box((500, 500, 200, 200), 0.4, 1920, 1080, min_padding=48) == pad_box(
+        (500, 500, 200, 200), 0.4, 1920, 1080
+    )
+    assert pad_box((500, 500, 200, 200), 0.4, 1920, 1080, min_padding=48) == (
+        420,
+        420,
+        360,
+        360,
+    )
+
+
+def test_pad_box_min_padding_zero_is_legacy():
+    box = (100, 100, 80, 60)
+    assert pad_box(box, 0.2, 1920, 1080, min_padding=0) == pad_box(box, 0.2, 1920, 1080)
+    assert pad_box(box, 0.0, 1920, 1080, min_padding=0) == box
+
+
+def test_pad_box_min_padding_clamps_to_edges():
+    # Near top-left: floor would push past 0, must clamp like today.
+    x, y, w, h = pad_box((5, 5, 20, 20), 0.0, 200, 200, min_padding=48)
+    assert x == 0
+    assert y == 0
+    assert x + w <= 200
+    assert y + h <= 200
+    assert w == 73  # 5 + 20 + 48 clamped at 0
+    assert h == 73
+
+
+def test_build_censor_boxes_min_padding_passthrough():
+    dets = [_det("FEMALE_BREAST_EXPOSED", box=(100, 100, 20, 20))]
+    boxes = build_censor_boxes(dets, CENSOR_PRESETS["all"], 0.0, 1920, 1080, min_padding=48)
+    assert boxes == [(52, 52, 116, 116)]
+    # Default keeps legacy output.
+    legacy = build_censor_boxes(dets, CENSOR_PRESETS["all"], 0.0, 1920, 1080)
+    assert legacy == [(100, 100, 20, 20)]
+
+
 # --- merge_overlapping_boxes tests ---
 
 
@@ -181,7 +226,7 @@ def test_full_censor_multiplier_value():
 
 
 def test_resolve_no_extra_flags_matches_preset():
-    for preset in ("none", "female", "male", "all"):
+    for preset in ("none", "female", "male", "all", "body"):
         assert resolve_censor_classes(preset) == CENSOR_PRESETS[preset]
 
 
@@ -238,6 +283,39 @@ def test_resolve_covered_all():
     assert "FEMALE_GENITALIA_COVERED" in result
 
 
+def test_body_preset_contents():
+    assert CENSOR_PRESETS["body"] == frozenset(
+        {
+            "FEMALE_GENITALIA_EXPOSED",
+            "FEMALE_BREAST_EXPOSED",
+            "MALE_GENITALIA_EXPOSED",
+            "ANUS_EXPOSED",
+            "BUTTOCKS_EXPOSED",
+            "MALE_BREAST_EXPOSED",
+            "FEET_EXPOSED",
+            "BELLY_EXPOSED",
+            "ARMPITS_EXPOSED",
+        }
+    )
+    assert not any(c.startswith("FACE_") for c in CENSOR_PRESETS["body"])
+    assert not any(c.endswith("_COVERED") for c in CENSOR_PRESETS["body"])
+
+
+def test_body_is_superset_of_all():
+    assert CENSOR_PRESETS["all"] <= CENSOR_PRESETS["body"]
+
+
+def test_body_with_covered():
+    assert resolve_censor_classes("body", covered=True) == CENSOR_PRESETS["body"] | frozenset(
+        {
+            "ANUS_COVERED",
+            "BUTTOCKS_COVERED",
+            "FEMALE_BREAST_COVERED",
+            "FEMALE_GENITALIA_COVERED",
+        }
+    )
+
+
 def test_resolve_face_male():
     result = resolve_censor_classes("female", face_male=True)
     assert "FACE_MALE" in result
@@ -253,6 +331,19 @@ def test_resolve_face_female():
 def test_resolve_feet():
     result = resolve_censor_classes("all", feet=True)
     assert "FEET_EXPOSED" in result
+
+
+def test_resolve_buttocks():
+    result = resolve_censor_classes("all", buttocks=True)
+    assert "BUTTOCKS_EXPOSED" in result
+    for cls in CENSOR_PRESETS["all"]:
+        assert cls in result
+    assert "BUTTOCKS_EXPOSED" not in resolve_censor_classes("all")
+
+
+def test_resolve_none_with_buttocks():
+    result = resolve_censor_classes("none", buttocks=True)
+    assert result == frozenset({"BUTTOCKS_EXPOSED"})
 
 
 def test_resolve_all_flags_combined():
@@ -288,6 +379,11 @@ def test_censor_config_resolve_matches_function():
 def test_censor_config_defaults():
     config = CensorConfig()
     assert config.resolve_classes() == CENSOR_PRESETS["all"]
+
+
+def test_censor_config_buttocks():
+    config = CensorConfig(preset="all", buttocks=True)
+    assert config.resolve_classes() == resolve_censor_classes("all", buttocks=True)
 
 
 # --- EraX class mapping contract test ---

@@ -4,7 +4,6 @@ import gc
 import logging
 import multiprocessing
 import os
-import queue
 import signal
 import subprocess
 import sys
@@ -26,9 +25,9 @@ def _add_censor_args(parser):
     )
     parser.add_argument(
         "--censor",
-        choices=["none", "female", "male", "all"],
+        choices=["none", "female", "male", "all", "body"],
         default="all",
-        help="What to censor: none, female, male, or all (default: all)",
+        help="What to censor: none, female, male, all, or body (all exposed body parts except faces) (default: all)",
     )
     parser.add_argument(
         "--padding",
@@ -90,6 +89,12 @@ def _add_censor_args(parser):
         help="Also censor exposed feet",
     )
     parser.add_argument(
+        "--buttocks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also censor exposed buttocks (off by default: more false positives, e.g. tight clothing)",
+    )
+    parser.add_argument(
         "--model",
         choices=["320n", "640m", "erax-nano", "erax-small", "erax-medium"],
         default=None,
@@ -111,7 +116,7 @@ def _add_temporal_args(parser):
         "--smooth-alpha",
         type=float,
         default=0.5,
-        help="EMA weight for box position smoothing, 0.0-1.0 (default: 0.5)",
+        help="EMA weight for video box smoothing, 0.0-1.0 (default: 0.5); live start ignores it",
     )
 
 
@@ -119,6 +124,9 @@ def _validate_censor_args(args):
     """Validate shared censor arguments. Exits on error."""
     if args.padding < 0:
         print(f"{error('Error:')} --padding must be >= 0", file=sys.stderr)
+        sys.exit(1)
+    if getattr(args, "min_padding", 0) < 0:
+        print(f"{error('Error:')} --min-padding must be >= 0", file=sys.stderr)
         sys.exit(1)
     if hasattr(args, "smooth_alpha") and not (0.0 <= args.smooth_alpha <= 1.0):
         print(f"{error('Error:')} --smooth-alpha must be between 0.0 and 1.0", file=sys.stderr)
@@ -155,9 +163,72 @@ def _warn_erax_unsupported(args):
     for attr, flag in ERAX_UNSUPPORTED_FLAGS.items():
         if getattr(args, attr, False):
             print(
-                f"{warn('Warning:')} {flag} has no effect with EraX models (no covered/face/feet classes)",
+                f"{warn('Warning:')} {flag} has no effect with EraX models (no covered/face/feet/buttocks classes)",
                 file=sys.stderr,
             )
+
+
+def _extra_scales_display(args) -> str:
+    """Format the resolved --extra-scales value for the Config line."""
+    from bsafe.detector import get_model_backend
+    from bsafe.live import parse_extra_scales
+
+    raw = getattr(args, "extra_scales", None)
+    try:
+        parsed = parse_extra_scales(raw)
+    except ValueError:
+        return str(raw)
+    if parsed is None:
+        try:
+            backend = get_model_backend(getattr(args, "model", None))
+        except ValueError:
+            return "0.5"
+        return "none" if backend == "erax" else "0.5"
+    if not parsed:
+        return "none"
+    try:
+        backend = get_model_backend(getattr(args, "model", None))
+    except ValueError:
+        backend = "nudenet"
+    if backend == "erax":
+        return "none"
+    return ",".join(f"{v:g}" for v in parsed)
+
+
+def _resolve_extra_scales_for_start(args, detect_scale: float) -> tuple[float, ...]:
+    """Resolve point-size extra scales and convert to frame-relative factors."""
+    from bsafe.detector import get_model_backend
+    from bsafe.live import parse_extra_scales, validate_extra_scales
+
+    raw = getattr(args, "extra_scales", None)
+    parsed = parse_extra_scales(raw)
+    if parsed is None:
+        backend = get_model_backend(getattr(args, "model", None))
+        resolved = () if backend == "erax" else (0.5,)
+    else:
+        backend = get_model_backend(getattr(args, "model", None))
+        if backend == "erax":
+            resolved = ()
+        else:
+            validate_extra_scales(parsed, detect_scale)
+            resolved = parsed
+    return tuple(s / detect_scale for s in resolved)
+
+
+def _validate_live_args(args):
+    """Validate start-only live flags. Exits on error before the helper starts."""
+    from bsafe.live import validate_live_options
+
+    scale = getattr(args, "detect_scale", 1.0)
+    if scale is None:
+        scale = 1.0
+        args.detect_scale = scale
+    raw_extra = getattr(args, "extra_scales", None)
+    try:
+        validate_live_options(getattr(args, "model", None), scale, raw_extra)
+    except ValueError as e:
+        print(f"{error('Error:')} {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _print_config(args):
@@ -177,6 +248,8 @@ def _print_config(args):
         f"method={censor_method}",
         f"padding={args.padding}",
     ]
+    if hasattr(args, "min_padding"):
+        parts.append(f"min_padding={args.min_padding}")
     extras = [
         name
         for name, enabled in [
@@ -184,6 +257,7 @@ def _print_config(args):
             ("face_male", args.face_male),
             ("face_female", args.face_female),
             ("feet", args.feet),
+            ("buttocks", args.buttocks),
             ("full_censor", args.full_censor),
         ]
         if enabled
@@ -192,6 +266,12 @@ def _print_config(args):
         parts.append(f"extras={','.join(extras)}")
     if hasattr(args, "enhance") and args.enhance:
         parts.append(f"enhance={args.enhance}")
+    if hasattr(args, "detect_scale"):
+        parts.append(f"detect_scale={args.detect_scale}")
+    if hasattr(args, "extra_scales"):
+        parts.append(f"extra_scales={_extra_scales_display(args)}")
+    if getattr(args, "stats", False):
+        parts.append("stats=true")
     print(f"{dim('Config:')} {', '.join(parts)}", flush=True)
 
 
@@ -210,22 +290,18 @@ def cmd_start(args):
         print(f"\n{bold('Stopped.')}")
         return
 
-    from bsafe.censor import (
-        FULL_CENSOR_MULTIPLIER,
-        build_censor_boxes,
-        expand_boxes,
-        resolve_censor_classes,
-    )
-    from bsafe.detector import Detector
+    from bsafe.censor import resolve_censor_classes
+    from bsafe.detector import Detector, get_model_backend, resolve_model
     from bsafe.ipc import FrameServer
-    from bsafe.swift_helper import spawn_helper
-    from bsafe.tracking import BoxTracker
+    from bsafe.live import LiveSession, LiveStats
+    from bsafe.swift_helper import StderrTail, spawn_helper
 
     fps = args.fps
     if fps < 1 or fps > 255:
         print(f"{error('Error:')} --fps must be between 1 and 255", file=sys.stderr)
         sys.exit(1)
     _validate_censor_args(args)
+    _validate_live_args(args)
     _resolve_confidence(args)
     socket_path = os.path.join(tempfile.gettempdir(), f"bsafe-{os.getpid()}.sock")
 
@@ -235,72 +311,153 @@ def cmd_start(args):
         face_male=args.face_male,
         face_female=args.face_female,
         feet=args.feet,
+        buttocks=args.buttocks,
     )
     padding = args.padding
-    tracker = BoxTracker(persist_frames=args.persist_frames, smooth_alpha=args.smooth_alpha)
+    show_stats = bool(getattr(args, "stats", False))
+    detect_scale_raw = getattr(args, "detect_scale", 1.0)
+    if detect_scale_raw is None:
+        detect_scale_raw = 1.0
+    detect_scale = float(detect_scale_raw)
+    stats = LiveStats() if show_stats else None
 
     # Warn about unsupported flags with EraX
     _warn_erax_unsupported(args)
+    from bsafe.live import parse_extra_scales as _parse_extra
+
+    try:
+        _parsed_extra = _parse_extra(getattr(args, "extra_scales", None))
+    except ValueError:
+        _parsed_extra = ()
+    try:
+        _is_erax_model = get_model_backend(getattr(args, "model", None)) == "erax"
+    except ValueError:
+        _is_erax_model = False
+    if _is_erax_model and _parsed_extra is not None and len(_parsed_extra) > 0:
+        print(
+            f"{warn('Warning:')} --extra-scales has no effect with EraX models (NudeNet-only)",
+            file=sys.stderr,
+        )
 
     _print_config(args)
 
-    # Initialize detector
+    # Initialize detector: NudeNet uses the full-frame GPU path, EraX the classic one.
     print(f"Loading model {bold(args.model or '320n')}...", flush=True)
-    detector = Detector(min_confidence=args.confidence, model=args.model)
+    backend = get_model_backend(args.model)
+    is_nudenet = backend != "erax"
+    if is_nudenet:
+        from bsafe.fastdetect import FullFrameNudeDetector
+
+        detector = FullFrameNudeDetector(
+            model_path=resolve_model(args.model).path,
+            min_confidence=args.confidence,
+        )
+    else:
+        detector = Detector(min_confidence=args.confidence, model=args.model)
+
+    # Resolve user-input-derived values before spawning the helper so nothing
+    # that can raise on user input runs between spawn_helper and try/finally.
+    extra_factors = _resolve_extra_scales_for_start(args, detect_scale)
+    if not is_nudenet:
+        extra_factors = ()
+    min_padding_int = int(getattr(args, "min_padding", 0))
 
     # Start IPC server
     server = FrameServer(
-        socket_path, fps=fps, blur=args.blur, pixels=args.pixels, censor_text=args.censor_text
+        socket_path,
+        fps=fps,
+        blur=args.blur,
+        pixels=args.pixels,
+        censor_text=args.censor_text,
+        scale_percent=round(detect_scale * 100),
+        persist_passes=max(1, min(255, args.persist_frames)),
+        smooth_percent=round(args.smooth_alpha * 100),
+        stats=show_stats,
+        on_stats=(lambda text: print(dim(f"native: {text}"), flush=True)) if show_stats else None,
     )
     server.start()
 
     # Spawn Swift helper
     print("Starting screen capture...", flush=True)
     helper = spawn_helper(socket_path, fps, display=args.display)
+    stderr_tail = StderrTail(helper.stderr) if helper.stderr is not None else None
 
     print(bold("Running...") + " press Ctrl+C to stop.", flush=True)
 
+    session = LiveSession(
+        server,
+        detector,
+        censor_classes=censor_classes,
+        padding=padding,
+        full_censor=bool(args.full_censor),
+        is_nudenet=is_nudenet,
+        stats=stats,
+        min_padding=min_padding_int,
+        extra_factors=extra_factors,
+    )
+    # Watchdog: if our parent dies we are reparented to init (ppid 1).
+    # Record the parent at start; only act when we started with a real
+    # parent (ppid != 1). A terminal closing also reparents, and exiting
+    # non-zero there is fine.
+    parent_pid = os.getppid()
+    # SIGTERM (menu-bar stop escalation, launchd, etc.) shuts down cleanly
+    # with exit 0, like Ctrl+C.
+    _prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _handle_sigterm(sig, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    helper_exit_code: int | None = None
     try:
         while True:
+            try:
+                if parent_pid != 1 and os.getppid() == 1:
+                    print(
+                        f"\n{error('Error:')} parent process died, shutting down",
+                        file=sys.stderr,
+                    )
+                    helper_exit_code = 1
+                    break
+            except OSError:
+                pass
             # Check if helper is still running
             if helper.poll() is not None:
-                stderr_out = helper.stderr.read() if helper.stderr else ""
+                stderr_out = stderr_tail.text() if stderr_tail is not None else ""
                 print(
                     f"\n{error('Error:')} Swift helper exited (code {helper.returncode})",
                     file=sys.stderr,
                 )
                 if stderr_out:
                     print(f"Helper stderr: {stderr_out}", file=sys.stderr)
+                code = helper.returncode
+                helper_exit_code = code if code else 1
                 break
 
-            # Dequeue and process frames
             try:
-                meta, jpeg_data = server.frame_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            detections = detector.detect(jpeg_data)
-            logger.debug("Processed frame: %d detection(s)", len(detections))
-            if detections:
-                for d in detections:
-                    logger.debug(
-                        "[detection] %s (%.2f) at %s on display %d",
-                        d.class_name,
-                        d.confidence,
-                        d.box,
-                        meta.display_id,
-                    )
-            boxes = build_censor_boxes(detections, censor_classes, padding, meta.width, meta.height)
-            if args.full_censor:
-                boxes = expand_boxes(boxes, FULL_CENSOR_MULTIPLIER, meta.width, meta.height)
-            boxes = tracker.update(meta.display_id, boxes)
-            server.send_censor(meta.display_id, meta.width, meta.height, boxes)
+                session.step(0.1)
+            except OSError as e:
+                # Socket closed under us (helper exited); the poll above reports the exit.
+                logger.debug("Live session send failed: %s", e)
+                if helper.poll() is None:
+                    print(f"\n{error('Error:')} lost connection to Swift helper", file=sys.stderr)
+                    helper_exit_code = 1
+                    break
+                code = helper.returncode
+                helper_exit_code = code if code else 1
+                break
 
     except KeyboardInterrupt:
         print(f"\n{bold('Shutting down...')}")
     finally:
+        try:
+            signal.signal(signal.SIGTERM, _prev_sigterm)
+        except OSError, ValueError:
+            pass
         server.shutdown()
         detector.close()
+        if show_stats and stats is not None:
+            print(dim(stats.summary()), flush=True)
         if helper.poll() is None:
             helper.terminate()
             try:
@@ -309,6 +466,9 @@ def cmd_start(args):
                 helper.kill()
                 helper.wait()
         print(bold("Stopped."))
+    if helper_exit_code:
+        return helper_exit_code
+    return 0
 
 
 def _expected_output(input_path: str, model: str | None) -> str:
@@ -452,6 +612,7 @@ def cmd_video(args):
         face_male=args.face_male,
         face_female=args.face_female,
         feet=args.feet,
+        buttocks=args.buttocks,
     )
 
     inputs = args.input
@@ -535,6 +696,7 @@ def cmd_image(args):
         face_male=args.face_male,
         face_female=args.face_female,
         feet=args.feet,
+        buttocks=args.buttocks,
     )
 
     inputs = args.input
@@ -606,6 +768,18 @@ def cmd_image(args):
     print("\a", end="", flush=True)
     if errors:
         sys.exit(1)
+
+
+def cmd_bench(args):
+    """Dispatch the offline replay benchmark (bsafe bench detect|replay|sweep)."""
+    from bsafe import bench
+
+    handlers = {
+        "detect": bench.cmd_detect,
+        "replay": bench.cmd_replay,
+        "sweep": bench.cmd_sweep,
+    }
+    handlers[args.bench_command](args)
 
 
 def cmd_displays(args):
@@ -714,6 +888,18 @@ def cmd_doctor(args):
         print(f"{warn('NOT FOUND')} — run: uv sync")
         all_ok = False
 
+    # ONNX Runtime CoreML (live GPU detection; warn only)
+    print("ONNX Runtime CoreML: ", end="")
+    try:
+        import onnxruntime
+
+        if "CoreMLExecutionProvider" in onnxruntime.get_available_providers():
+            print(success("OK"))
+        else:
+            print(f"{warn('WARN')} — CPU fallback (live detection will be slower)")
+    except ImportError:
+        print(f"{warn('WARN')} — CPU fallback (live detection will be slower)")
+
     # Swift helper binary
     print("Swift helper: ", end="")
     from bsafe.swift_helper import find_helper
@@ -769,7 +955,12 @@ def _build_parser():
 
     # start subcommand
     start_parser = subparsers.add_parser("start", help="Start the censoring process")
-    start_parser.add_argument("--fps", type=int, default=45, help="Capture FPS (default: 45)")
+    start_parser.add_argument(
+        "--fps",
+        type=int,
+        default=60,
+        help="Capture FPS; up to the display refresh rate, e.g. 120 on ProMotion (default: 60)",
+    )
     _add_censor_args(start_parser)
     _add_temporal_args(start_parser)
     start_parser.add_argument(
@@ -782,6 +973,32 @@ def _build_parser():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Run without Swift helper or detector",
+    )
+    start_parser.add_argument(
+        "--stats",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log live detection timing every ~2s plus native capture/tracking stats",
+    )
+    start_parser.add_argument(
+        "--detect-scale",
+        type=float,
+        default=1.0,
+        help="Detection resolution as a multiple of the display's point size (default 1.0). "
+        "1.5 detects images down to ~100 pt wide at ~2x GPU cost",
+    )
+    start_parser.add_argument(
+        "--min-padding",
+        type=int,
+        default=0,
+        help="Minimum padding in capture pixels per side, added to small boxes (default: 0; try 24)",
+    )
+    start_parser.add_argument(
+        "--extra-scales",
+        type=str,
+        default=None,
+        help="Extra detection passes at these multiples of point size (comma list, each < --detect-scale; "
+        "default 0.5 for NudeNet, 'none' to disable). Catches large close-ups the full-res pass misses",
     )
 
     # video subcommand
@@ -826,6 +1043,133 @@ def _build_parser():
         help="Output file path (default: <input>.<model>.bsafe.<ext>)",
     )
     _add_censor_args(image_parser)
+
+    # bench subcommand (offline replay benchmark)
+    bench_parser = subparsers.add_parser("bench", help="Offline replay benchmark")
+    bench_subparsers = bench_parser.add_subparsers(dest="bench_command", required=True)
+
+    bench_detect_parser = bench_subparsers.add_parser(
+        "detect", help="Detect on every frame of a recording (writes DIR/dets.jsonl)"
+    )
+    bench_detect_parser.add_argument("input", help="Path to the screen recording")
+    bench_detect_parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output directory; dets.jsonl is written there",
+    )
+    bench_detect_parser.add_argument(
+        "--model",
+        choices=["320n", "640m"],
+        default="320n",
+        help="NudeNet model: '320n' (default, bundled) or '640m' (requires download)",
+    )
+    bench_detect_parser.add_argument(
+        "--extra-scales",
+        type=str,
+        default=None,
+        help="Extra detection passes as frame-relative factors, e.g. '0.5' (the recording "
+        "is already at the live capture size, so factors are relative to the frame)",
+    )
+
+    bench_replay_parser = bench_subparsers.add_parser(
+        "replay", help="Replay detections through the Swift tracker and score the result"
+    )
+    bench_replay_parser.add_argument("dir", help="Directory produced by 'bsafe bench detect'")
+    bench_replay_parser.add_argument(
+        "--censor",
+        choices=["none", "female", "male", "all", "body"],
+        default="body",
+        help="What to censor: none, female, male, all, or body (default: body)",
+    )
+    bench_replay_parser.add_argument(
+        "--padding",
+        type=float,
+        default=0.4,
+        help="Box expansion fraction (default: 0.4)",
+    )
+    bench_replay_parser.add_argument(
+        "--min-padding",
+        type=int,
+        default=0,
+        help="Minimum padding in capture pixels per side (added to small boxes)",
+    )
+    bench_replay_parser.add_argument(
+        "--persist-passes",
+        type=int,
+        default=8,
+        help="Tracker passes a box persists after disappearing (default: 8)",
+    )
+    bench_replay_parser.add_argument(
+        "--min-persist-s",
+        type=float,
+        default=1.0,
+        help="Minimum persistence time in seconds (default: 1.0)",
+    )
+    bench_replay_parser.add_argument(
+        "--shrink-alpha",
+        type=float,
+        default=0.1,
+        help="Per-0.1s shrink factor for inward edges (default: 0.1)",
+    )
+    bench_replay_parser.add_argument(
+        "--present-lead-ms",
+        type=float,
+        default=16.0,
+        help="How far ahead of a frame's pts its boxes are shown (default: 16)",
+    )
+    bench_replay_parser.add_argument(
+        "--overhead-ms",
+        type=float,
+        default=6.0,
+        help="Simulated detection/IPC overhead per request (default: 6)",
+    )
+    bench_replay_parser.add_argument(
+        "--name",
+        default=None,
+        help="Run subdirectory name (default: derived from the tracker config)",
+    )
+    bench_replay_parser.add_argument(
+        "--gt-dets",
+        action="append",
+        default=None,
+        help="GT dets.jsonl for recall scoring (repeatable; default: DIR/dets.jsonl)",
+    )
+    bench_replay_parser.add_argument(
+        "--gt-conf",
+        type=float,
+        default=0.25,
+        help="Min confidence for all GT sources (default: 0.25)",
+    )
+
+    bench_sweep_parser = bench_subparsers.add_parser(
+        "sweep", help="Run a grid of padding/tracker configs and print a table"
+    )
+    bench_sweep_parser.add_argument("dir", help="Directory produced by 'bsafe bench detect'")
+    bench_sweep_parser.add_argument(
+        "--censor",
+        choices=["none", "female", "male", "all", "body"],
+        default="body",
+        help="What to censor: none, female, male, all, or body (default: body)",
+    )
+    bench_sweep_parser.add_argument(
+        "--min-padding",
+        type=int,
+        default=0,
+        help="Minimum padding in capture pixels per side, applied to all sweep configs",
+    )
+    bench_sweep_parser.add_argument(
+        "--gt-dets",
+        action="append",
+        default=None,
+        help="GT dets.jsonl for recall scoring (repeatable; default: DIR/dets.jsonl)",
+    )
+    bench_sweep_parser.add_argument(
+        "--gt-conf",
+        type=float,
+        default=0.25,
+        help="Min confidence for all GT sources (default: 0.25)",
+    )
 
     subparsers.add_parser("displays", help="List connected displays")
     subparsers.add_parser("doctor", help="Check system requirements")
@@ -884,7 +1228,10 @@ def main():
         "bootstrap": cmd_bootstrap,
         "video": cmd_video,
         "image": cmd_image,
+        "bench": cmd_bench,
     }
 
     faulthandler.enable()
-    commands[args.command](args)
+    result = commands[args.command](args)
+    if isinstance(result, int) and result != 0:
+        sys.exit(result)

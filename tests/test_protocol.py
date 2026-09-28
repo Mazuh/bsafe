@@ -8,25 +8,48 @@ from bsafe.protocol import (
     CENSOR_BOX_SIZE,
     CENSOR_HEADER_FMT,
     CENSOR_HEADER_SIZE,
+    CENSOR_SEQ_HEADER_FMT,
+    CENSOR_SEQ_HEADER_SIZE,
     CMD_CENSOR,
+    CMD_CENSOR_SEQ,
     CMD_CENSOR_STYLE,
+    CMD_REQUEST_FRAME,
     CMD_SHUTDOWN,
     CMD_START,
     CMD_STOP,
+    DISPLAY_INFO_FMT,
+    DISPLAY_INFO_SIZE,
     FRAME_META_FMT,
     FRAME_META_SIZE,
     HEADER_FMT,
     MAX_MESSAGE_SIZE,
+    MSG_DISPLAY_INFO,
     MSG_FRAME,
+    MSG_FRAME_RAW,
+    MSG_STATS,
+    RAW_FRAME_META_FMT,
+    RAW_FRAME_META_SIZE,
+    START_FMT,
+    DisplayInfo,
     FrameMetadata,
+    RawFrameMeta,
     pack_cmd_censor,
+    pack_cmd_censor_seq,
     pack_cmd_censor_style,
+    pack_cmd_request_frame,
     pack_cmd_start,
+    pack_display_info,
     pack_message,
+    pack_raw_frame,
     parse_censor_payload,
+    parse_censor_seq_payload,
     parse_censor_style_payload,
+    parse_cmd_start_payload,
+    parse_display_info_payload,
     parse_frame_payload,
+    parse_raw_frame_payload,
     read_message,
+    read_message_into,
 )
 
 
@@ -34,6 +57,22 @@ def _make_recv(data: bytes):
     """Create a recv_fn from bytes."""
     stream = io.BytesIO(data)
     return stream.read
+
+
+def _make_recv_into(data: bytes, chunk: int = 1):
+    """Create a recv_into(view, nbytes) fake returning at most chunk bytes per call."""
+
+    stream = io.BytesIO(data)
+
+    def recv_into(view, nbytes):
+        want = min(chunk, nbytes)
+        piece = stream.read(want)
+        if not piece:
+            return 0
+        view[: len(piece)] = piece
+        return len(piece)
+
+    return recv_into
 
 
 def test_pack_and_read_empty_payload():
@@ -55,7 +94,8 @@ def test_pack_cmd_start():
     raw = pack_cmd_start(fps=3)
     msg_type, payload = read_message(_make_recv(raw))
     assert msg_type == CMD_START
-    assert struct.unpack("!B", payload)[0] == 3
+    assert payload == struct.pack(START_FMT, 3, 100, 8, 50, 0)
+    assert parse_cmd_start_payload(payload) == (3, 100, 8, 50, False)
 
 
 def test_frame_round_trip():
@@ -286,3 +326,210 @@ def test_parse_censor_style_payload_too_short():
 
     with pytest.raises(ValueError, match="too short"):
         parse_censor_style_payload(b"\x01")
+
+
+# --- Live v2 protocol tests ---
+
+
+def test_max_message_size_is_256mib():
+    assert MAX_MESSAGE_SIZE == 256 * 1024 * 1024
+
+
+def test_raw_frame_meta_size():
+    assert struct.calcsize(RAW_FRAME_META_FMT) == RAW_FRAME_META_SIZE == 24
+
+
+def test_display_info_size():
+    assert struct.calcsize(DISPLAY_INFO_FMT) == DISPLAY_INFO_SIZE == 20
+
+
+def test_censor_seq_header_size():
+    assert struct.calcsize(CENSOR_SEQ_HEADER_FMT) == CENSOR_SEQ_HEADER_SIZE == 18
+
+
+def test_cmd_start_exact_layout():
+    raw = pack_cmd_start(60, 150, 4, 100, True)
+    msg_type, payload = read_message(_make_recv(raw))
+    assert msg_type == CMD_START
+    assert payload == struct.pack("!BHBBB", 60, 150, 4, 100, 1)
+    assert parse_cmd_start_payload(payload) == (60, 150, 4, 100, True)
+
+
+def test_cmd_start_defaults():
+    raw = pack_cmd_start(45)
+    _, payload = read_message(_make_recv(raw))
+    assert payload == struct.pack("!BHBBB", 45, 100, 8, 50, 0)
+
+
+def test_cmd_start_legacy_parse():
+    assert parse_cmd_start_payload(b"\x07") == (7, 100, 8, 50, False)
+
+
+def test_cmd_start_validation():
+    import pytest
+
+    with pytest.raises(ValueError):
+        pack_cmd_start(0)
+    with pytest.raises(ValueError):
+        pack_cmd_start(256)
+    with pytest.raises(ValueError):
+        pack_cmd_start(60, 99, 8, 50, False)
+    with pytest.raises(ValueError):
+        pack_cmd_start(60, 201, 8, 50, False)
+    with pytest.raises(ValueError):
+        pack_cmd_start(60, 100, 0, 50, False)
+    with pytest.raises(ValueError):
+        pack_cmd_start(60, 100, 256, 50, False)
+    with pytest.raises(ValueError):
+        pack_cmd_start(60, 100, 8, 101, False)
+    with pytest.raises(ValueError):
+        parse_cmd_start_payload(b"\x01\x02")
+
+
+def test_raw_frame_round_trip():
+    pixels = bytes(range(64))  # 4x4 BGRA
+    meta = RawFrameMeta(display_id=2, width=4, height=4, pts_ns=999, seq=41)
+    raw = pack_raw_frame(meta, pixels)
+    msg_type, payload = read_message(_make_recv(raw))
+    assert msg_type == MSG_FRAME_RAW
+    parsed_meta, view = parse_raw_frame_payload(payload)
+    assert parsed_meta == meta
+    assert bytes(view) == pixels
+
+
+def test_raw_frame_zero_copy():
+    header = struct.pack(RAW_FRAME_META_FMT, 1, 2, 1, 0, 7)
+    buf = bytearray(header + b"\x01\x02\x03\x04\x05\x06\x07\x08")
+    meta, view = parse_raw_frame_payload(buf)
+    assert meta == RawFrameMeta(1, 2, 1, 0, 7)
+    assert isinstance(view, memoryview)
+    # Mutating the source is visible through the view: shared memory, no copy.
+    buf[RAW_FRAME_META_SIZE] = 0xFF
+    assert view[0] == 0xFF
+
+
+def test_raw_frame_length_mismatch():
+    import pytest
+
+    header = struct.pack(RAW_FRAME_META_FMT, 1, 4, 4, 0, 1)
+    with pytest.raises(ValueError):
+        parse_raw_frame_payload(header + b"\x00" * 10)
+    with pytest.raises(ValueError):
+        parse_raw_frame_payload(b"short")
+
+
+def test_raw_frame_zero_dimension():
+    import pytest
+
+    header = struct.pack(RAW_FRAME_META_FMT, 1, 0, 4, 0, 1)
+    with pytest.raises(ValueError):
+        parse_raw_frame_payload(header)
+
+
+def test_display_info_round_trip():
+    info = DisplayInfo(3, 2560, 1664, 1728, 1117)
+    raw = pack_display_info(info)
+    msg_type, payload = read_message(_make_recv(raw))
+    assert msg_type == MSG_DISPLAY_INFO
+    assert parse_display_info_payload(payload) == info
+
+
+def test_display_info_too_short():
+    import pytest
+
+    with pytest.raises(ValueError, match="too short"):
+        parse_display_info_payload(b"\x00" * 5)
+
+
+def test_request_frame_round_trip():
+    raw = pack_cmd_request_frame(9)
+    msg_type, payload = read_message(_make_recv(raw))
+    assert msg_type == CMD_REQUEST_FRAME
+    assert struct.unpack("!I", payload)[0] == 9
+
+
+def test_censor_seq_round_trip():
+    boxes = [(1, 2, 30, 40), (100, 200, 50, 60)]
+    raw = pack_cmd_censor_seq(5, 1728, 1117, 123, boxes)
+    msg_type, payload = read_message(_make_recv(raw))
+    assert msg_type == CMD_CENSOR_SEQ
+    assert parse_censor_seq_payload(payload) == (5, 1728, 1117, 123, boxes)
+
+
+def test_censor_seq_zero_boxes():
+    raw = pack_cmd_censor_seq(5, 1728, 1117, 124, [])
+    _, payload = read_message(_make_recv(raw))
+    assert parse_censor_seq_payload(payload) == (5, 1728, 1117, 124, [])
+
+
+def test_censor_seq_too_many_boxes():
+    import pytest
+
+    with pytest.raises(ValueError):
+        pack_cmd_censor_seq(1, 2, 3, 4, [(0, 0, 1, 1)] * 65536)
+
+
+def test_censor_seq_too_short():
+    import pytest
+
+    with pytest.raises(ValueError, match="too short"):
+        parse_censor_seq_payload(b"short")
+    header = struct.pack(CENSOR_SEQ_HEADER_FMT, 1, 2, 3, 4, 2)
+    with pytest.raises(ValueError, match="too short"):
+        parse_censor_seq_payload(header + struct.pack("!iiii", 1, 2, 3, 4))
+
+
+def test_stats_message_round_trip():
+    raw = pack_message(MSG_STATS, "fps=60".encode())
+    msg_type, payload = read_message(_make_recv(raw))
+    assert msg_type == MSG_STATS
+    assert payload.decode() == "fps=60"
+
+
+def test_read_message_into_single_bytes():
+    raw = pack_message(CMD_STOP) + pack_cmd_start(9, 120, 3, 25, False)
+    recv_into = _make_recv_into(raw, chunk=1)
+    t1, p1 = read_message_into(recv_into)
+    assert t1 == CMD_STOP
+    assert p1 == bytearray()
+    t2, p2 = read_message_into(recv_into)
+    assert t2 == CMD_START
+    assert bytes(p2) == struct.pack("!BHBBB", 9, 120, 3, 25, 0)
+
+
+def test_read_message_into_chunked_payload():
+    pixels = bytes((i * 7) & 0xFF for i in range(4 * 3 * 4))
+    raw = pack_raw_frame(RawFrameMeta(1, 4, 3, 5, 6), pixels)
+    recv_into = _make_recv_into(raw, chunk=7)
+    msg_type, payload = read_message_into(recv_into)
+    assert msg_type == MSG_FRAME_RAW
+    assert isinstance(payload, bytearray)
+    meta, view = parse_raw_frame_payload(payload)
+    assert meta == RawFrameMeta(1, 4, 3, 5, 6)
+    assert bytes(view) == pixels
+
+
+def test_read_message_into_rejects_oversized():
+    import pytest
+
+    huge_length = MAX_MESSAGE_SIZE + 2
+    header = struct.pack(HEADER_FMT, huge_length, MSG_FRAME_RAW)
+    with pytest.raises(ValueError, match="too large"):
+        read_message_into(_make_recv_into(header))
+
+
+def test_read_message_into_rejects_zero_length():
+    import pytest
+
+    header = struct.pack(HEADER_FMT, 0, MSG_FRAME_RAW)
+    with pytest.raises(ValueError):
+        read_message_into(_make_recv_into(header))
+
+
+def test_read_message_into_closed():
+    import pytest
+
+    with pytest.raises(ConnectionError):
+        read_message_into(_make_recv_into(b""))
+    with pytest.raises(ConnectionError):
+        read_message_into(_make_recv_into(b"\x00\x00"))

@@ -9,7 +9,7 @@ from bsafe.detector import Detection
 FULL_CENSOR_MULTIPLIER = 3
 
 # BUTTOCKS_EXPOSED is intentionally excluded — too many false positives in practice
-# (e.g. tight clothing, seated posture) and low user-reported value for censoring.
+# (e.g. tight clothing, seated posture) and low user-reported value for censoring. Opt in with --buttocks.
 CENSOR_PRESETS: dict[str, frozenset[str]] = {
     "none": frozenset(),
     "female": frozenset(
@@ -33,6 +33,21 @@ CENSOR_PRESETS: dict[str, frozenset[str]] = {
             "ANUS_EXPOSED",
         }
     ),
+    # body: every exposed body-part class except faces. BELLY/ARMPITS/FEET_COVERED stay out:
+    # they fire on ordinary clothing.
+    "body": frozenset(
+        {
+            "FEMALE_GENITALIA_EXPOSED",
+            "FEMALE_BREAST_EXPOSED",
+            "MALE_GENITALIA_EXPOSED",
+            "ANUS_EXPOSED",
+            "BUTTOCKS_EXPOSED",
+            "MALE_BREAST_EXPOSED",
+            "FEET_EXPOSED",
+            "BELLY_EXPOSED",
+            "ARMPITS_EXPOSED",
+        }
+    ),
 }
 
 
@@ -45,6 +60,7 @@ class CensorConfig:
     face_male: bool = False
     face_female: bool = False
     feet: bool = False
+    buttocks: bool = False
 
     def resolve_classes(self) -> frozenset[str]:
         """Build the set of classes to censor from preset plus additive flags."""
@@ -54,6 +70,7 @@ class CensorConfig:
             face_male=self.face_male,
             face_female=self.face_female,
             feet=self.feet,
+            buttocks=self.buttocks,
         )
 
 
@@ -64,6 +81,7 @@ def resolve_censor_classes(
     face_male: bool = False,
     face_female: bool = False,
     feet: bool = False,
+    buttocks: bool = False,
 ) -> frozenset[str]:
     """Build the set of classes to censor from a preset plus additive flags."""
     if preset not in CENSOR_PRESETS:
@@ -74,7 +92,7 @@ def resolve_censor_classes(
     if covered and preset != "none":
         classes.update({"ANUS_COVERED", "BUTTOCKS_COVERED"})
         # Male breast is considered SFW in most cultures, so only add female breast covered.
-        if preset in ("female", "all"):
+        if preset in ("female", "all", "body"):
             classes.update({"FEMALE_BREAST_COVERED", "FEMALE_GENITALIA_COVERED"})
     if face_male:
         classes.add("FACE_MALE")
@@ -82,6 +100,8 @@ def resolve_censor_classes(
         classes.add("FACE_FEMALE")
     if feet:
         classes.add("FEET_EXPOSED")
+    if buttocks:
+        classes.add("BUTTOCKS_EXPOSED")
     return frozenset(classes)
 
 
@@ -98,11 +118,12 @@ def pad_box(
     padding: float,
     display_w: int,
     display_h: int,
+    min_padding: int = 0,
 ) -> tuple[int, int, int, int]:
     """Expand (x, y, w, h) by padding fraction, clamp to bounds, return (x, y, w, h)."""
     x, y, w, h = box
-    pad_x = int(w * padding)
-    pad_y = int(h * padding)
+    pad_x = max(int(w * padding), min_padding)
+    pad_y = max(int(h * padding), min_padding)
 
     nx = max(0, x - pad_x)
     ny = max(0, y - pad_y)
@@ -182,8 +203,9 @@ def build_censor_boxes(
     padding: float,
     display_w: int,
     display_h: int,
+    min_padding: int = 0,
 ) -> list[tuple[int, int, int, int]]:
     """Filter detections, pad boxes, merge overlaps, return list of (x, y, w, h) tuples."""
     filtered = filter_detections(detections, classes)
-    padded = [pad_box(d.box, padding, display_w, display_h) for d in filtered]
+    padded = [pad_box(d.box, padding, display_w, display_h, min_padding) for d in filtered]
     return merge_overlapping_boxes(padded)
